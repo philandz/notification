@@ -27,5 +27,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=builder /app/target/release/notification /usr/local/bin/notification
 COPY --from=builder /app/migrations /app/migrations
 
-EXPOSE 9108 50108
+EXPOSE 9109 50109
 ENTRYPOINT ["/usr/local/bin/notification"]

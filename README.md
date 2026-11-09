@@ -2,8 +2,8 @@
 
 Philandz notification service: personal inbox, system broadcasts (super-admin), preferences and per-budget mutes.
 
-- gRPC `service.notification.NotificationService` on `:50108` (proto: `protobuf/notification/notification.proto`)
-- HTTP `:9108` exposes `/health` only. Business endpoints are reached through the gateway (`/api/notification/*`).
+- gRPC `service.notification.NotificationService` on `:50109` (proto: `protobuf/notification/notification.proto`)
+- HTTP `:9109` exposes `/health` only. Business endpoints are reached through the gateway (`/api/notification/*`).
 - MySQL 8, migrations in `./migrations` run on startup.
 
 ## Model
@@ -19,7 +19,7 @@ Philandz notification service: personal inbox, system broadcasts (super-admin), 
 cp .env.example .env     # then edit values
 export $(grep -v '^#' .env | sed 's/ *#.*//' | xargs)
 cargo run
-curl localhost:9108/health
+curl localhost:9109/health
 ```
 
 ## Tests
