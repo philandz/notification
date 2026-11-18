@@ -151,6 +151,19 @@ pub struct DbItem {
     pub archived_at: Option<i64>,
 }
 
+/// One queued email (a snapshot of the notification it announces).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DbDelivery {
+    pub id: String,
+    pub user_id: String,
+    pub category: String,
+    pub event_type: String,
+    pub params_json: String,
+    pub link: Option<String>,
+    pub fallback_text: String,
+    pub attempts: i32,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DbBroadcast {
     pub id: String,

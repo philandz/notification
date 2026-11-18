@@ -9,7 +9,8 @@ use crate::pb::service::notification::{
     AdminUpdateBroadcastRequest, ArchiveRequest, Broadcast, GetPreferencesRequest,
     GetUnreadCountRequest, ListActiveBannersRequest, ListActiveBannersResponse, ListInboxRequest,
     ListInboxResponse, MarkAllReadRequest, MarkReadRequest, Preferences, PublishRequest,
-    PublishResponse, SetBudgetMuteRequest, UnreadCount, UpdatePreferencesRequest,
+    PublishResponse, SetBudgetMuteRequest, UnreadCount, UnsubscribeEmailRequest,
+    UnsubscribeEmailResponse, UpdatePreferencesRequest,
 };
 
 pub struct NotificationHandler {
@@ -162,6 +163,16 @@ impl NotificationService for NotificationHandler {
         Ok(Response::new(
             self.biz.admin_list_broadcasts(request.into_inner()).await?,
         ))
+    }
+
+    async fn unsubscribe_email(
+        &self,
+        request: Request<UnsubscribeEmailRequest>,
+    ) -> Result<Response<UnsubscribeEmailResponse>, Status> {
+        // Public on purpose: the signed token in the email is the credential.
+        let token = request.into_inner().token;
+        let category = self.biz.unsubscribe_email(&token).await?;
+        Ok(Response::new(UnsubscribeEmailResponse { category }))
     }
 
     async fn publish(

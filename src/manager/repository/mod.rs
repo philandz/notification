@@ -4,7 +4,7 @@
 use anyhow::Result;
 use sqlx::{MySql, MySqlPool, QueryBuilder};
 
-use crate::converters::{DbBroadcast, DbBroadcastView, DbItem};
+use crate::converters::{DbBroadcast, DbBroadcastView, DbDelivery, DbItem};
 
 const ITEM_COLS: &str = "id, recipient_user_id, org_id, budget_id, category, event_type, \
     severity, actor_user_id, params_json, link, fallback_text, source_event_id, dedup_key, \
@@ -70,6 +70,19 @@ pub struct BroadcastWrite {
     pub publish_at: Option<i64>,
     pub expires_at: Option<i64>,
     pub show_banner: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewDelivery {
+    pub user_id: String,
+    pub delivery_key: String,
+    pub source_event_id: String,
+    pub category: String,
+    pub event_type: String,
+    pub severity: String,
+    pub params_json: String,
+    pub link: Option<String>,
+    pub fallback_text: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -764,6 +777,167 @@ impl NotificationRepository {
     }
 
     // -----------------------------------------------------------------------
+    // Email deliveries (Phase 4)
+    // -----------------------------------------------------------------------
+
+    /// Of `recipients`, the users who want email for `category`: their stored choice, or
+    /// `default_on` when they never changed it. Muted budgets are dropped when `apply_mutes`.
+    pub async fn email_recipients(
+        &self,
+        recipients: &[String],
+        category: &str,
+        default_on: bool,
+        budget_id: Option<&str>,
+        apply_mutes: bool,
+    ) -> Result<Vec<String>> {
+        if recipients.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut overrides = std::collections::HashMap::<String, bool>::new();
+        let mut qb = QueryBuilder::<MySql>::new(
+            "SELECT user_id, enabled FROM notification_preferences WHERE channel = 'email' \
+             AND category = ",
+        );
+        qb.push_bind(category).push(" AND user_id IN (");
+        push_in_list(&mut qb, recipients);
+        for (u, e) in qb
+            .build_query_as::<(String, bool)>()
+            .fetch_all(&self.pool)
+            .await?
+        {
+            overrides.insert(u, e);
+        }
+        let mut muted = std::collections::HashSet::<String>::new();
+        if let (true, Some(budget_id)) = (apply_mutes, budget_id.filter(|b| !b.is_empty())) {
+            let mut qb = QueryBuilder::<MySql>::new(
+                "SELECT user_id FROM notification_budget_mutes WHERE budget_id = ",
+            );
+            qb.push_bind(budget_id).push(" AND user_id IN (");
+            push_in_list(&mut qb, recipients);
+            for (u,) in qb
+                .build_query_as::<(String,)>()
+                .fetch_all(&self.pool)
+                .await?
+            {
+                muted.insert(u);
+            }
+        }
+        Ok(recipients
+            .iter()
+            .filter(|r| !muted.contains(*r) && overrides.get(*r).copied().unwrap_or(default_on))
+            .cloned()
+            .collect())
+    }
+
+    /// Queue an email once per (user, key). Returns false when it was already queued.
+    pub async fn enqueue_delivery(&self, d: &NewDelivery, now: i64) -> Result<bool> {
+        let r = sqlx::query(
+            "INSERT IGNORE INTO notification_deliveries (id, user_id, channel, delivery_key, \
+             source_event_id, category, event_type, severity, params_json, link, fallback_text, \
+             status, attempts, next_attempt_at, created_at, updated_at) \
+             VALUES (?, ?, 'email', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&d.user_id)
+        .bind(&d.delivery_key)
+        .bind(&d.source_event_id)
+        .bind(&d.category)
+        .bind(&d.event_type)
+        .bind(&d.severity)
+        .bind(&d.params_json)
+        .bind(&d.link)
+        .bind(&d.fallback_text)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    pub async fn due_deliveries(&self, now: i64, limit: i64) -> Result<Vec<DbDelivery>> {
+        Ok(sqlx::query_as(
+            "SELECT id, user_id, category, event_type, params_json, link, fallback_text, attempts \
+             FROM notification_deliveries \
+             WHERE status = 'pending' AND channel = 'email' AND next_attempt_at <= ? \
+             ORDER BY next_attempt_at, id LIMIT ?",
+        )
+        .bind(now)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Take a lease on a due delivery; false when another worker got it.
+    pub async fn claim_delivery(&self, id: &str, now: i64, lease_secs: i64) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE notification_deliveries SET attempts = attempts + 1, next_attempt_at = ?, \
+             updated_at = ? WHERE id = ? AND status = 'pending' AND next_attempt_at <= ?",
+        )
+        .bind(now + lease_secs)
+        .bind(now)
+        .bind(id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    pub async fn mark_delivery_sent(&self, id: &str, message_id: &str, now: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE notification_deliveries SET status = 'sent', provider_message_id = ?, \
+             last_error = NULL, updated_at = ? WHERE id = ?",
+        )
+        .bind(message_id)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Terminal state: `failed` or `skipped`.
+    pub async fn finish_delivery(&self, id: &str, status: &str, why: &str, now: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE notification_deliveries SET status = ?, last_error = ?, updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(status)
+        .bind(why)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn retry_delivery(&self, id: &str, why: &str, next_at: i64, now: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE notification_deliveries SET last_error = ?, next_attempt_at = ?, \
+             updated_at = ? WHERE id = ?",
+        )
+        .bind(why)
+        .bind(next_at)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn sent_count_since(&self, user_id: &str, since: i64) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM notification_deliveries WHERE user_id = ? AND channel = 'email' \
+             AND status = 'sent' AND updated_at >= ?",
+        )
+        .bind(user_id)
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    // -----------------------------------------------------------------------
     // Cleanup
     // -----------------------------------------------------------------------
 
@@ -794,6 +968,13 @@ impl NotificationRepository {
                 break;
             }
         }
+        // Finished email deliveries are only kept for the daily-cap window plus a margin.
+        sqlx::query(
+            "DELETE FROM notification_deliveries WHERE status <> 'pending' AND updated_at < ?",
+        )
+        .bind(applied_before)
+        .execute(&self.pool)
+        .await?;
         for _ in 0..100 {
             let n = sqlx::query(
                 "DELETE FROM notification_applied_events WHERE applied_at < ? LIMIT 5000",

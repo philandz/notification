@@ -2,6 +2,7 @@ use axum::{routing::get, Json, Router};
 use notification::config::{NotificationServiceConfig, NotificationTuning};
 use notification::handler::NotificationHandler;
 use notification::manager::biz::NotificationBiz;
+use notification::manager::email::{EmailDispatcher, EmailSettings, IdentityContacts};
 use notification::manager::repository::NotificationRepository;
 use notification::pb::service::notification::notification_service_server::NotificationServiceServer;
 use std::{net::SocketAddr, sync::Arc};
@@ -31,12 +32,28 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to init repository: {e}"))?;
     tracing::info!("Storage initialized");
 
-    let biz = Arc::new(NotificationBiz::new(
-        repo,
-        config.internal_token.clone(),
-        NotificationTuning::from_env(),
-    ));
+    let email = EmailSettings::from_env(&config.internal_token);
+    let email_repo = NotificationRepository::from_pool(repo.pool().clone());
+    let biz = Arc::new(
+        NotificationBiz::new(
+            repo,
+            config.internal_token.clone(),
+            NotificationTuning::from_env(),
+        )
+        .with_email(email.clone()),
+    );
     biz.spawn_cleanup();
+    if email.active {
+        let mailer = Arc::new(philand_notify::ResendMailer::new(
+            philand_notify::ApiKeySource::Env(email.api_key.clone()),
+        ));
+        let contacts = Arc::new(IdentityContacts::connect_lazy(
+            &email.identity_grpc_url,
+            &config.internal_token,
+        )?);
+        Arc::new(EmailDispatcher::new(email_repo, email, mailer, contacts)).spawn();
+        tracing::info!("email channel enabled");
+    }
     let grpc_handler = NotificationHandler::new(biz);
 
     let grpc_addr: SocketAddr = format!("{}:{}", config.grpc_host, config.grpc_port).parse()?;

@@ -7,7 +7,10 @@ use crate::converters::{
     audience_to_db, category_from_db, category_to_db, channel_from_db, channel_to_db,
     severity_to_db, status_to_db, DbBroadcast, Locale,
 };
-use crate::manager::repository::{ApplyOutcome, BroadcastWrite, NewItem, NotificationRepository};
+use crate::manager::email::{token, EmailSettings};
+use crate::manager::repository::{
+    ApplyOutcome, BroadcastWrite, NewDelivery, NewItem, NotificationRepository,
+};
 use crate::manager::validate;
 use crate::pb::service::notification::{
     AdminListBroadcastsRequest, AdminListBroadcastsResponse, ArchiveRequest, Banner, Broadcast,
@@ -31,9 +34,14 @@ pub fn is_locked(category: NotificationCategory, channel: NotificationChannel) -
     category == NotificationCategory::Security && channel == NotificationChannel::InApp
 }
 
-/// Every cell is on by default; only changes are stored.
-pub fn default_enabled(_category: NotificationCategory, _channel: NotificationChannel) -> bool {
-    true
+/// In-app is on by default. Email costs per message, so it is opt-in (security excepted), and
+/// Telegram is not available yet. Only changes from the default are stored.
+pub fn default_enabled(category: NotificationCategory, channel: NotificationChannel) -> bool {
+    match channel {
+        NotificationChannel::InApp | NotificationChannel::Unspecified => true,
+        NotificationChannel::Email => category == NotificationCategory::Security,
+        NotificationChannel::Telegram => false,
+    }
 }
 
 fn internal(context: &str, e: impl std::fmt::Display) -> Status {
@@ -69,6 +77,7 @@ pub struct NotificationBiz {
     repo: NotificationRepository,
     internal_token: String,
     tuning: NotificationTuning,
+    email: EmailSettings,
 }
 
 impl NotificationBiz {
@@ -81,7 +90,18 @@ impl NotificationBiz {
             repo,
             internal_token,
             tuning,
+            email: EmailSettings::disabled(),
         }
+    }
+
+    /// Turn the email channel on (queueing + preference cells + unsubscribe).
+    pub fn with_email(mut self, email: EmailSettings) -> Self {
+        self.email = email;
+        self
+    }
+
+    pub fn email_active(&self) -> bool {
+        self.email.active
     }
 
     pub fn repo(&self) -> &NotificationRepository {
@@ -159,7 +179,86 @@ impl NotificationBiz {
                 ApplyOutcome::Skipped => resp.skipped += 1,
             }
         }
+        if self.email.active {
+            self.queue_emails(&req, &valid.recipients, category, severity, locked, now)
+                .await?;
+        }
         Ok(resp)
+    }
+
+    /// Queue one email per recipient who opted in to this category. Independent of the in-app
+    /// outcome (the user may have switched the inbox off) and idempotent per delivery key.
+    async fn queue_emails(
+        &self,
+        req: &PublishRequest,
+        recipients: &[String],
+        category: &str,
+        severity: &str,
+        locked: bool,
+        now: i64,
+    ) -> Result<(), Status> {
+        let default_on = default_enabled(category_from_db(category), NotificationChannel::Email);
+        let budget_id = non_empty(&req.budget_id);
+        let wanted = self
+            .repo
+            .email_recipients(
+                recipients,
+                category,
+                default_on,
+                budget_id.as_deref(),
+                !locked,
+            )
+            .await
+            .map_err(|e| internal("filter email recipients", e))?;
+        let key = non_empty(&req.dedup_key).unwrap_or_else(|| req.event_id.clone());
+        for user_id in wanted {
+            let delivery = NewDelivery {
+                user_id,
+                delivery_key: key.clone(),
+                source_event_id: req.event_id.clone(),
+                category: category.to_string(),
+                event_type: req.r#type.clone(),
+                severity: severity.to_string(),
+                params_json: if req.params_json.is_empty() {
+                    "{}".to_string()
+                } else {
+                    req.params_json.clone()
+                },
+                link: non_empty(&req.link),
+                fallback_text: req.fallback_text.trim().to_string(),
+            };
+            self.repo
+                .enqueue_delivery(&delivery, now)
+                .await
+                .map_err(|e| internal("queue email", e))?;
+        }
+        Ok(())
+    }
+
+    /// One-click unsubscribe from the link in an email: turns that category's email off.
+    pub async fn unsubscribe_email(&self, token_str: &str) -> Result<String, Status> {
+        self.unsubscribe_email_at(token_str, now()).await
+    }
+
+    pub async fn unsubscribe_email_at(&self, token_str: &str, now: i64) -> Result<String, Status> {
+        let claim = token::verify(&self.email.unsubscribe_secret, token_str, now)
+            .ok_or_else(|| Status::invalid_argument("invalid or expired link"))?;
+        let category = category_from_db(&claim.category);
+        if !PERSONAL_CATEGORIES.contains(&category) {
+            return Err(Status::invalid_argument("invalid or expired link"));
+        }
+        self.repo
+            .set_preference(
+                &claim.user_id,
+                category_to_db(category),
+                channel_to_db(NotificationChannel::Email),
+                false,
+                default_enabled(category, NotificationChannel::Email),
+                now,
+            )
+            .await
+            .map_err(|e| internal("save preference", e))?;
+        Ok(claim.category)
     }
 
     // -----------------------------------------------------------------------
@@ -345,10 +444,14 @@ impl NotificationBiz {
             .muted_budgets(user_id)
             .await
             .map_err(|e| internal("load mutes", e))?;
-        let channel = NotificationChannel::InApp;
-        let cells = PERSONAL_CATEGORIES
+        let mut channels = vec![NotificationChannel::InApp];
+        if self.email.active {
+            channels.push(NotificationChannel::Email);
+        }
+        let cells = channels
             .iter()
-            .map(|&category| {
+            .flat_map(|&channel| PERSONAL_CATEGORIES.iter().map(move |&c| (c, channel)))
+            .map(|(category, channel)| {
                 let locked = is_locked(category, channel);
                 let stored = overrides.iter().find(|(c, ch, _)| {
                     category_from_db(c) == category && channel_from_db(ch) == channel
@@ -398,9 +501,11 @@ impl NotificationBiz {
             }
             let channel = NotificationChannel::try_from(cell.channel)
                 .unwrap_or(NotificationChannel::Unspecified);
-            if channel != NotificationChannel::InApp {
+            let allowed = channel == NotificationChannel::InApp
+                || (channel == NotificationChannel::Email && self.email.active);
+            if !allowed {
                 return Err(Status::invalid_argument(
-                    "only the in-app channel is available",
+                    "this notification channel is not available",
                 ));
             }
             if is_locked(category, channel) && !cell.enabled {

@@ -23,6 +23,11 @@ philand_logging     = { package = "logging",     path = "../libs/logging" }
 philand_configs     = { package = "configs",     path = "../libs/configs" }
 philand_application = { package = "application", path = "../libs/application" }
 philand_storage     = { package = "storage",     path = "../libs/storage" }
+philand_notify      = { package = "notify",      path = "../libs/notify" }
+async-trait = "0.1"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }
