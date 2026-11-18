@@ -18,10 +18,15 @@ use tonic::{transport::Channel, Code, Request};
 const TOKEN: &str = "internal-secret";
 
 async fn start() -> NotificationServiceClient<Channel> {
+    // Migrations are not safe to run from several tests at once (sqlx locking is off).
+    static INIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
-    let repo = NotificationRepository::new(&url, "./migrations")
-        .await
-        .unwrap();
+    let repo = {
+        let _guard = INIT.lock().await;
+        NotificationRepository::new(&url, "./migrations")
+            .await
+            .unwrap()
+    };
     let biz = Arc::new(NotificationBiz::new(
         repo,
         TOKEN.into(),

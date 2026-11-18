@@ -275,14 +275,7 @@ async fn unsubscribe_link_turns_the_category_off() {
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
 async fn email_cells_only_appear_when_the_channel_is_active() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
-    let off = NotificationBiz::new(
-        NotificationRepository::new(&url, "./migrations")
-            .await
-            .unwrap(),
-        "tok".into(),
-        NotificationTuning::default(),
-    );
+    let off = NotificationBiz::new(repo().await, "tok".into(), NotificationTuning::default());
     let p = off.preferences(&uid()).await.unwrap();
     assert!(p
         .cells
