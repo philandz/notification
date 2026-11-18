@@ -14,6 +14,24 @@ Philandz notification service: personal inbox, system broadcasts (super-admin), 
 - Security category and critical severity bypass preferences/mutes. Links must be relative (`/path`).
 - Cleanup task: read 90d, unread 180d, archived 30d, applied events 14d.
 
+## Email channel (Phase 4)
+Email is **opt-in** because the provider (Resend) bills per message: in-app is on by default, email is
+off for every category except `security`. Users switch it per category in `/settings/notifications`
+(the Email column only appears when the channel is active). Nothing is sent unless
+`NOTIFY_EMAIL_ENABLED=true` **and** `RESEND_API_KEY` is set; with either missing the service behaves
+exactly as before.
+
+- On `Publish`, a recipient who opted in gets a row in `notification_deliveries` (idempotent per
+  `dedup_key` or `event_id`). It is independent of the in-app setting.
+- A worker (every `NOTIFY_EMAIL_INTERVAL_SECS`) claims due rows, resolves email + locale through
+  identity's internal `GetUserContacts` RPC (`x-internal-token`), renders vi/en and sends with
+  `libs/notify::ResendMailer`. Retries use backoff (1m, 4m, 16m… up to 6h) and stop after
+  `NOTIFY_EMAIL_MAX_ATTEMPTS`; 4xx from Resend (other than 429) fail immediately.
+- `NOTIFY_EMAIL_DAILY_CAP` (default 3) limits emails per user per 24h; extra ones are marked `skipped`.
+- Every email links to a signed one-click unsubscribe (`GET /api/notification/unsubscribe?token=` shows a
+  confirm button, `POST` applies it and turns that category's email off).
+- Inspect: `SELECT status, last_error, COUNT(*) FROM notification_deliveries GROUP BY 1,2;`
+
 ## Run locally
 ```bash
 cp .env.example .env     # then edit values
