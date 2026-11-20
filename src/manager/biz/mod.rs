@@ -7,7 +7,7 @@ use crate::converters::{
     audience_to_db, category_from_db, category_to_db, channel_from_db, channel_to_db,
     severity_to_db, status_to_db, DbBroadcast, Locale,
 };
-use crate::manager::email::{token, EmailSettings};
+use crate::manager::email::{token, ContactSource, EmailSettings};
 use crate::manager::repository::{
     ApplyOutcome, BroadcastWrite, NewDelivery, NewItem, NotificationRepository,
 };
@@ -78,7 +78,12 @@ pub struct NotificationBiz {
     internal_token: String,
     tuning: NotificationTuning,
     email: EmailSettings,
+    /// Resolves actor display names for the inbox. `None`: names stay empty.
+    names: Option<std::sync::Arc<dyn ContactSource>>,
 }
+
+/// How long the inbox waits for actor names before answering without them.
+const NAME_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 impl NotificationBiz {
     pub fn new(
@@ -91,6 +96,40 @@ impl NotificationBiz {
             internal_token,
             tuning,
             email: EmailSettings::disabled(),
+            names: None,
+        }
+    }
+
+    /// Look actor display names up for the inbox.
+    pub fn with_names(mut self, names: std::sync::Arc<dyn ContactSource>) -> Self {
+        self.names = Some(names);
+        self
+    }
+
+    /// Fills `actor_name` on the items that have an actor. Best effort: a slow or failing
+    /// identity service only costs the names, never the inbox.
+    async fn attach_actor_names(&self, items: &mut [InboxItem]) {
+        let Some(names) = &self.names else { return };
+        let mut ids: Vec<String> = items
+            .iter()
+            .filter(|i| !i.actor_user_id.is_empty())
+            .map(|i| i.actor_user_id.clone())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            return;
+        }
+        match tokio::time::timeout(NAME_LOOKUP_TIMEOUT, names.display_names(&ids)).await {
+            Ok(Ok(map)) => {
+                for item in items.iter_mut() {
+                    if let Some(name) = map.get(&item.actor_user_id) {
+                        item.actor_name = name.clone();
+                    }
+                }
+            }
+            Ok(Err(e)) => tracing::warn!("inbox: actor names unavailable: {e}"),
+            Err(_) => tracing::warn!("inbox: actor name lookup timed out"),
         }
     }
 
@@ -283,14 +322,36 @@ impl NotificationBiz {
         let cursor = decode_cursor(&req.cursor)?;
         let unread_only =
             InboxFilter::try_from(req.filter).unwrap_or(InboxFilter::All) == InboxFilter::Unread;
-        let kind = NotificationKind::try_from(req.kind).unwrap_or(NotificationKind::Unspecified);
+        let mut kind =
+            NotificationKind::try_from(req.kind).unwrap_or(NotificationKind::Unspecified);
         let locale = Locale::parse(&req.locale);
+        // A category narrows the inbox: SYSTEM means broadcasts, anything else
+        // means personal items of that category only.
+        let category = NotificationCategory::try_from(req.category)
+            .unwrap_or(NotificationCategory::Unspecified);
+        let personal_category = match category {
+            NotificationCategory::Unspecified => None,
+            NotificationCategory::System => {
+                kind = NotificationKind::System;
+                None
+            }
+            other => {
+                kind = NotificationKind::Personal;
+                Some(category_to_db(other))
+            }
+        };
 
         let mut items: Vec<InboxItem> = Vec::new();
         if kind != NotificationKind::System {
             let rows = self
                 .repo
-                .list_personal(user_id, unread_only, cursor.as_ref(), limit + 1)
+                .list_personal(
+                    user_id,
+                    unread_only,
+                    personal_category,
+                    cursor.as_ref(),
+                    limit + 1,
+                )
                 .await
                 .map_err(|e| internal("list personal", e))?;
             items.extend(rows.into_iter().map(|r| r.into_proto()));
@@ -311,6 +372,7 @@ impl NotificationBiz {
                 next_cursor = encode_cursor(last.updated_at, &last.id);
             }
         }
+        self.attach_actor_names(&mut items).await;
         Ok(ListInboxResponse { items, next_cursor })
     }
 

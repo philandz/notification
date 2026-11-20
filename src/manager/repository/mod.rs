@@ -281,6 +281,7 @@ impl NotificationRepository {
         &self,
         user_id: &str,
         unread_only: bool,
+        category: Option<&str>,
         cursor: Option<&(i64, String)>,
         limit: i64,
     ) -> Result<Vec<DbItem>> {
@@ -291,11 +292,17 @@ impl NotificationRepository {
         if unread_only {
             sql.push_str(" AND read_at IS NULL");
         }
+        if category.is_some() {
+            sql.push_str(" AND category = ?");
+        }
         if cursor.is_some() {
             sql.push_str(" AND (updated_at < ? OR (updated_at = ? AND id < ?))");
         }
         sql.push_str(" ORDER BY updated_at DESC, id DESC LIMIT ?");
         let mut q = sqlx::query_as::<_, DbItem>(&sql).bind(user_id);
+        if let Some(c) = category {
+            q = q.bind(c);
+        }
         if let Some((ts, id)) = cursor {
             q = q.bind(ts).bind(ts).bind(id);
         }

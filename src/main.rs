@@ -34,23 +34,26 @@ async fn main() -> anyhow::Result<()> {
 
     let email = EmailSettings::from_env(&config.internal_token);
     let email_repo = NotificationRepository::from_pool(repo.pool().clone());
+    // Identity is also where the inbox gets actor names from; the client is lazy, so a
+    // missing identity service only costs the names.
+    let contacts = Arc::new(IdentityContacts::connect_lazy(
+        &email.identity_grpc_url,
+        &config.internal_token,
+    )?);
     let biz = Arc::new(
         NotificationBiz::new(
             repo,
             config.internal_token.clone(),
             NotificationTuning::from_env(),
         )
-        .with_email(email.clone()),
+        .with_email(email.clone())
+        .with_names(contacts.clone()),
     );
     biz.spawn_cleanup();
     if email.active {
         let mailer = Arc::new(philand_notify::ResendMailer::new(
             philand_notify::ApiKeySource::Env(email.api_key.clone()),
         ));
-        let contacts = Arc::new(IdentityContacts::connect_lazy(
-            &email.identity_grpc_url,
-            &config.internal_token,
-        )?);
         Arc::new(EmailDispatcher::new(email_repo, email, mailer, contacts)).spawn();
         tracing::info!("email channel enabled");
     }
