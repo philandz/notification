@@ -224,6 +224,7 @@ impl DbItem {
             created_at: self.created_at,
             updated_at: self.updated_at,
             read_at: self.read_at.unwrap_or(0),
+            actor_name: String::new(),
         }
     }
 }
@@ -265,6 +266,7 @@ impl DbBroadcastView {
             created_at: ts,
             updated_at: ts,
             read_at: self.read_at.unwrap_or(0),
+            actor_name: String::new(),
         }
     }
 
