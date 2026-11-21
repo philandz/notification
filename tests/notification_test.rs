@@ -1000,3 +1000,54 @@ async fn cleanup_removes_old_items_and_keeps_recent_ones() {
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].created_at, T0 + 200 * day);
 }
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_inbox_filters_by_category() {
+    let biz = biz().await;
+    let u = uid();
+    biz.publish_at(event(&[&u]), T0).await.unwrap();
+    let mut comment = event(&[&u]);
+    comment.r#type = "entry.comment_added".into();
+    comment.category = NotificationCategory::Activity as i32;
+    biz.publish_at(comment, T0 + 1).await.unwrap();
+
+    let only = |c: NotificationCategory| ListInboxRequest {
+        category: c as i32,
+        ..inbox(10)
+    };
+    let reminders = biz
+        .list_inbox_at(&u, only(NotificationCategory::Reminder), T0 + 2)
+        .await
+        .unwrap()
+        .items;
+    assert_eq!(reminders.len(), 1);
+    assert_eq!(reminders[0].r#type, "debt.payment_due");
+
+    let activity = biz
+        .list_inbox_at(&u, only(NotificationCategory::Activity), T0 + 2)
+        .await
+        .unwrap()
+        .items;
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0].r#type, "entry.comment_added");
+
+    // SYSTEM means broadcasts only, so none of this user's personal items show up.
+    let system = biz
+        .list_inbox_at(&u, only(NotificationCategory::System), T0 + 2)
+        .await
+        .unwrap()
+        .items;
+    assert!(system
+        .iter()
+        .all(|i| i.kind == NotificationKind::System as i32));
+
+    assert_eq!(
+        biz.list_inbox_at(&u, inbox(10), T0 + 2)
+            .await
+            .unwrap()
+            .items
+            .len(),
+        2
+    );
+}

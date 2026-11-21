@@ -125,6 +125,21 @@ pub struct Contact {
 pub trait ContactSource: Send + Sync {
     /// `Ok(None)`: the user does not exist (any more). `Err`: try again later.
     async fn contact(&self, user_id: &str) -> Result<Option<Contact>, String>;
+
+    /// Display names for several users in one call (user id → name). Unknown users are left
+    /// out. The default looks them up one by one.
+    async fn display_names(
+        &self,
+        user_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        let mut out = std::collections::HashMap::new();
+        for id in user_ids {
+            if let Some(c) = self.contact(id).await? {
+                out.insert(id.clone(), c.display_name);
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Looks contacts up through identity's internal `GetUserContacts` RPC.
@@ -171,6 +186,34 @@ impl ContactSource for IdentityContacts {
                 display_name: c.display_name,
                 locale: c.locale,
             }))
+    }
+
+    async fn display_names(
+        &self,
+        user_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        let mut req = tonic::Request::new(GetUserContactsRequest {
+            user_ids: user_ids.to_vec(),
+        });
+        req.metadata_mut().insert(
+            "x-internal-token",
+            self.token
+                .parse()
+                .map_err(|_| "invalid internal token".to_string())?,
+        );
+        let resp = self
+            .client
+            .clone()
+            .get_user_contacts(req)
+            .await
+            .map_err(|e| format!("identity: {}", e.message()))?;
+        Ok(resp
+            .into_inner()
+            .contacts
+            .into_iter()
+            .filter(|c| !c.display_name.is_empty())
+            .map(|c| (c.user_id, c.display_name))
+            .collect())
     }
 }
 
